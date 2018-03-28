@@ -7,8 +7,7 @@
 module Main where
 
 import Control.Distributed.Process
-import Control.Distributed.Process.Node (initRemoteTable, runProcess)
-import qualified Control.Distributed.Process.Node as Local
+import Control.Distributed.Process.Node
 
 import Network.Socket (HostName, ServiceName)
 import Network.Transport.TCP (createTransport, defaultTCPParameters)
@@ -19,7 +18,9 @@ import Control.Monad (forever)
 import Options.Applicative
 -- import ClassyPrelude
 import BasicPrelude
+import qualified Data.Map as M
 import Data.IORef
+import Control.Concurrent.MVar
 import Control.Error.Util
 import System.Random.MWC
 
@@ -42,8 +43,8 @@ optsParser = do
   optsHost <- optional $ strOption $ long "host" ++ short 'H'
   optsPort <- optional $ strOption $ long "port" ++ short 'P'
   optsPeerId <- optional $ strOption $ long "peer-id" ++ short 'i'
-  optsSendFor <- option auto $ long "send-for" ++ value 2
-  optsWaitFor <- option auto $ long "wait-for" ++ value 1
+  optsSendFor <- option auto $ short 's' ++ long "send-for" ++ value 2
+  optsWaitFor <- option auto $ short 'w' ++ long "wait-for" ++ value 1
   optsSeed <- option auto $ long "with-seed" ++ value 0
   return Opts{..}
 
@@ -60,9 +61,14 @@ peersConf =
 blockSize :: Int
 blockSize = 1000
 
-type Msg = (Double, Double)
-type Block = [Msg]
-type BlockChain = [Block]
+type Msg = Double
+type History = Map Timestamp Double
+type Timestamp = Int
+
+data NodeState = NodeState
+  { stateHist :: !History
+  , stateTime :: !Timestamp
+  } deriving (Show)
 
 main :: IO ()
 main = do
@@ -76,48 +82,63 @@ main = do
   rnd <- initRandomGen optsSeed
 
   Right transport <- createTransport host port (\port' -> (host, port')) defaultTCPParameters
-  node <- Local.newLocalNode transport initRemoteTable
+  node <- newLocalNode transport initRemoteTable
 
   sendOverRef <- newIORef False
   waitOverRef <- newIORef False
-  _ <- forkIO $ timeKeeper sendOverRef optsSendFor
-  _ <- forkIO $ timeKeeper waitOverRef optsWaitFor
-  runProcess node $ process peers rnd sendOverRef waitOverRef
-  return ()
+  stateVar <- newMVar (NodeState mempty 0)
+  scoreVar <- newEmptyMVar
+  _ <- forkIO $ timer sendOverRef optsSendFor >> computeScore optsWaitFor stateVar (putMVar scoreVar)
+  _ <- forkIO $ timer waitOverRef (optsSendFor + optsWaitFor)
+  _ <- forkProcess node $ msgSender peers rnd sendOverRef stateVar
+  _ <- forkProcess node $ msgReceiver peers waitOverRef stateVar
+  errLn $ "Started "  ++ tshow thisNode
+  takeMVar scoreVar >>= uncurry (printf "%d\t%3.0f\n")
 
-timeKeeper :: IORef Bool -> Int -> IO ()
-timeKeeper eventRef delay = do
-  threadDelay $ delay * 1000000
+timer :: IORef Bool -> Int -> IO ()
+timer eventRef delay = do
+  threadDelay $ delay * 10^6
   atomicWriteIORef eventRef True
 
-process :: [NodeId] -> GenIO -> IORef Bool -> IORef Bool -> Process ()
-process peers rnd sendOverRef waitOverRef = do
+computeScore :: Int -> MVar NodeState -> ((Int, Double) -> IO ()) -> IO ()
+computeScore waitFor stateVar putScore = do
+  threadDelay $ (waitFor * 900 * 10^3 :: Int)
+  msgs <- M.toAscList . stateHist <$> takeMVar stateVar
+  let score = sum [fromIntegral i * val | (i, (_, val)) <- zip [1 :: Int ..] msgs]
+  putScore (length msgs, score)
+
+msgSender :: [NodeId] -> GenIO -> IORef Bool -> MVar NodeState -> Process ()
+msgSender peers rnd sendOverRef stateVar = do
   thisPid <- getSelfPid
-  register "test" thisPid
-  inbox <- liftIO $ newIORef ([] :: [Msg])
-  let appendMsg msg = liftIO $ modifyIORef inbox $ (++ [msg])
+  register "msgSender" thisPid
   forever $ do
     liftIO (readIORef sendOverRef) >>= \case
       True -> do
-        -- liftIO $ errLn $ "Done: " ++ tshow thisPid
-        liftIO $ do
-          msgs <- sort <$> readIORef inbox
-          let score = sum [fromIntegral i * x | (i, (_, x)) <- zip [1 :: Int ..] msgs]
-          printf "%.0f\n" score
         terminate
       False -> do
-        outMsg <- liftIO $ do
-          val <- liftIO $ getRandom rnd
-          time :: Double <- realToFrac <$> getPOSIXTime
-          return (time, val)
-        forM_ peers $ \peer -> nsendRemote peer "test" outMsg
-        appendMsg outMsg
-        m <- expectTimeout 1000000
-        case m of
-          Nothing  -> say "Nothing..."
-          Just (msg :: Msg) -> do
-            say $ "Received " ++ show msg
-            appendMsg msg
+        msg <- liftIO $ modifyMVar stateVar $ \state@NodeState{..} -> do
+          val <- getRandom rnd
+          let time' = stateTime + 1
+          let msg = (time', val)
+          return (state { stateTime = time', stateHist = M.insert time' val stateHist }, msg)
+        forM_ peers $ \peer -> nsendRemote peer "msgReceiver" msg
+        say $ "Sent " ++ show msg
+
+msgReceiver :: [NodeId] -> IORef Bool -> MVar NodeState -> Process ()
+msgReceiver _peers waitOverRef stateVar = do
+  thisPid <- getSelfPid
+  register "msgReceiver" thisPid
+  forever $ do
+    liftIO (readIORef waitOverRef) >>= \case
+      True -> do
+        terminate
+      False -> do
+        msg@(time, val) <- expect
+        say $ "Received " ++ show msg
+        liftIO $ modifyMVar stateVar $ \state@NodeState{..} -> do
+          let time' = max time stateTime
+          return (state { stateTime = time', stateHist = M.insert time' val stateHist }, ())
+
 
 hostPortToNode :: (String, String) -> NodeId
 hostPortToNode (host, port) = NodeId $ TCP.encodeEndPointAddress host port 0
