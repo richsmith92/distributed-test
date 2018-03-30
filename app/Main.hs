@@ -120,11 +120,12 @@ main = do
   scoreVar <- newEmptyMVar
   _ <- forkIO $ timer envSendTimeOver optsSendFor >> computeScore env optsWaitFor (putMVar scoreVar)
   _ <- forkIO $ timer envRecvTimeOver (optsSendFor + optsWaitFor)
-  senders <- forM (zip [0..] envNodeIds) $ \(otherIx, otherNodeId) -> do
+  let otherNodes = [(i, node) | (i, node) <- zip [0..] envNodeIds, i /= optsPeerIx]
+  senders <- forM otherNodes $ \(otherIx, otherNodeId) -> do
     forkProcess localNode $ msgSender env otherIx otherNodeId
-  forM_ (zip [0..] envNodeIds) $ \(otherIx, otherNodeId) -> do
+  forM_ otherNodes $ \(otherIx, otherNodeId) -> do
     forkProcess localNode $ msgReceiver env otherIx otherNodeId
-  _ <- forkProcess localNode $ msgGenerator env senders
+  _ <- forkProcess localNode $ generator env senders
   writeLog $ "Started "  ++ tshow thisNode
   takeMVar scoreVar >>= \score -> do
     let out = T.pack $ uncurry (printf "(%d, %.0f)") score
@@ -133,10 +134,10 @@ main = do
     envSay ""
     takeMVar loggerDone >>= writeLog
 
-msgGenerator :: NodeEnv -> [ProcessId] -> Process ()
-msgGenerator NodeEnv{..} senderPids = do
+generator :: NodeEnv -> [ProcessId] -> Process ()
+generator NodeEnv{..} senderPids = do
   thisPid <- getSelfPid
-  register "msgGenerator" thisPid
+  register "generator" thisPid
   loop 0
   where
   Opts{..} = envOpts
@@ -147,11 +148,13 @@ msgGenerator NodeEnv{..} senderPids = do
         envSay "Generator done"
         terminate
        | otherwise -> do
-        val <- liftIO envRandom
-        msg <- liftIO $ modifyMVar envState $ \state@NodeState{..} -> do
-          let time' = incrementTime optsPeerIx stateTime
-          let msg = Msg { msgNodeIx = optsPeerIx, msgTime = time', msgValue = val }
-          return (state, msg)
+        msgValue <- liftIO envRandom
+        (msg, size) <- liftIO $ modifyMVar envState $ \state -> do
+          let msgTime = incrementTime optsPeerIx (stateTime state)
+          let msg = Msg { msgNodeIx = optsPeerIx, .. }
+          let state' = state {stateTime = msgTime, stateHist = M.insert msgTime msgValue (stateHist state)}
+          return (state', (msg, M.size (stateHist state')))
+        envSay $ T.intercalate "\t" ["History size: " ++ tshow size, "generator", tshowMsg msg]
         forM_ senderPids $ \pid -> send pid msg
         loop (nSent + 1)
 
@@ -168,7 +171,7 @@ msgSender env@NodeEnv{..} recvIx recvNodeId = do
   recvName = regName "msgReceiver" optsPeerIx
   loop recvPid nSent = do
     -- instantly try to pick message from inbox, and if failed, request a new message from generator
-    msg :: Msg <- expectTimeout 0 >>= maybe (nsend "msgGenerator" () >> expect) return
+    msg :: Msg <- expectTimeout 0 >>= maybe (nsend "generator" () >> expect) return
     send recvPid msg
     envSay $ T.intercalate "\t" [T.pack thisName, tshowMsg msg]
     loop recvPid (nSent + 1)
@@ -189,10 +192,13 @@ msgReceiver NodeEnv{..} senderIx senderNodeId = do
         terminate
       False -> do
         msg@Msg{..} <- expect
-        envSay $ T.intercalate "\t" [T.pack thisName, tshowMsg msg]
-        liftIO $ modifyMVar envState $ \state@NodeState{..} -> do
-          let time' = mergeTime optsPeerIx msgTime stateTime
-          return (state { stateTime = time', stateHist = M.insert time' msgValue stateHist }, ())
+        (time, size) <- liftIO $ modifyMVar envState $ \state -> do
+          let time' = mergeTime optsPeerIx msgTime (stateTime state)
+          let state' = state {stateTime = time', stateHist = M.insert msgTime msgValue (stateHist state)}
+          let size = M.size (stateHist state')
+          return (state', (time', size))
+        envSay $ T.intercalate "\t" ["History size: " ++ tshow size, T.pack thisName, tshowMsg msg, "@" ++ tshow time]
+        -- envSay $ T.unwords ["Inserted", tshowMsg msg]
   where
   Opts{..} = envOpts
   -- senderName = regName "msgSender" optsPeerIx
@@ -201,9 +207,9 @@ msgReceiver NodeEnv{..} senderIx senderNodeId = do
 computeScore :: NodeEnv -> Int -> ((Int, Double) -> IO ()) -> IO ()
 computeScore NodeEnv{..} waitFor putScore = do
   threadDelay $ (waitFor * 900 * 10^3 :: Int)
-  msgs <- M.toAscList . stateHist <$> takeMVar envState
-  let score = sum [fromIntegral i * val | (i, (_, val)) <- zip [1 :: Int ..] msgs]
-  putScore (length msgs, score)
+  hist <- stateHist <$> takeMVar envState
+  let score = sum [fromIntegral i * val | (i, (_, val)) <- zip [1 :: Int ..] (M.toAscList hist)]
+  putScore (M.size hist, score)
 
 getRemotePid :: NodeEnv -> String -> NodeId -> String -> Process ProcessId
 getRemotePid NodeEnv{..} thisName otherNodeId otherName = loop 0
@@ -215,12 +221,12 @@ getRemotePid NodeEnv{..} thisName otherNodeId otherName = loop 0
     let timeoutMicro = min 50000 (round $ 1.1 ^ n)
     expectTimeout timeoutMicro >>= \case
       Just (WhereIsReply name (Just pid)) -> do -- yay!
-        envSay $ T.intercalate "\t" [T.pack thisName, "got whereis", T.pack name]
+        envSay $ T.unwords [T.pack thisName, "connected"]
         return pid
       other -> do
         case other of
           Just (WhereIsReply wtf _) ->
-            envSay $ T.intercalate "\t" [T.pack thisName, "whereis message: ", T.pack wtf]
+            envSay $ T.intercalate "\t" ["WARN", T.pack thisName, "whereis: ", T.pack wtf]
           Nothing -> return ()
         loop (n + 1)
 
@@ -249,7 +255,8 @@ incrementTime thisIx = V.imap (\i -> if i == thisIx then succ else id)
 
 mergeTime :: Int -> Timestamp -> Timestamp -> Timestamp
 mergeTime thisIx senderTime thisTime =
-  V.izipWith (\i that this -> if i == thisIx then this + 1 else max that this) senderTime thisTime
+  -- V.izipWith (\i that this -> if i == thisIx then this + 1 else max that this) senderTime thisTime
+  V.zipWith max senderTime thisTime
 
 optsParser :: Parser Opts
 optsParser = do
