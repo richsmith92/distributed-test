@@ -27,7 +27,7 @@ executable testnode
       base >=4.7 && <5
     , distributed-process, network-transport-tcp
     , optparse-applicative, basic-prelude, errors
-    , mwc-random, vector, time, containers
+    , mwc-random, vector, time, containers, binary, vector-binary-instances, text
     , network
   default-language: Haskell2010
 
