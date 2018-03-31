@@ -50,7 +50,7 @@ import Data.Time
 data Opts = Opts
   -- { optsHost :: Maybe String
   -- , optsPort :: Maybe String
-  { optsPeerIx :: Int
+  { optsNodeIx :: Int
   , optsSendFor :: Int
   , optsWaitFor :: Int
   , optsSeed :: Int
@@ -59,14 +59,6 @@ data Opts = Opts
 
 type PeerList = [(String, String)]
 type HostPort = (String, String)
-
-peersConf :: PeerList
-peersConf =
-  [ ("127.0.0.1", "12300")
-  , ("127.0.0.1", "12301")
-  , ("127.0.0.1", "12302")
-  , ("127.0.0.1", "12303")
-  ]
 
 data Msg = Msg
   { msgNodeIx :: Int
@@ -77,12 +69,10 @@ instance Binary Msg
 
 type History = Map Timestamp Double
 type Timestamp = V.Vector Int
-
 data NodeState = NodeState
   { stateHist :: !History
   , stateTime :: !Timestamp
   } deriving (Show)
-
 data NodeEnv = NodeEnv
   { envOpts :: Opts
   , envNodeIds :: [NodeId]
@@ -95,21 +85,27 @@ data NodeEnv = NodeEnv
   , envScoreMVar :: MVar (Int, Double)
   }
 
+getNodeList :: IO [((String, String), NodeId)]
+getNodeList = do
+  rows <- T.lines <$> T.readFile "nodes.txt"
+  return $ map (node . map T.unpack . T.splitOn ":") rows
+  where
+  node [host, port] =
+    ((host, port), NodeId $ TCP.encodeEndPointAddress host port 0)
+
 main :: IO ()
 main = do
   envStartTime <- getCurrentTime
   -- logChan <- newTChanIO
   -- loggerDone <- newEmptyMVar
   -- _ <- forkIO $ logger logChan >> putMVar loggerDone ()
-
   opts@Opts{..} <- execParser $ info (helper <*> optsParser) $ progDesc ""
-  let hostPort@(host, port) = peersConf !! optsPeerIx
-  -- print (host, port)
-
-  let thisNode = hostPortToNode hostPort
-  -- let otherPeers = filter (/= thisNode ) $ map hostPortToNode peersConf
-  let envNodeIds = map hostPortToNode peersConf
-  let nPeers = length envNodeIds
+  nodes <- getNodeList
+  let nNodes = length nodes
+  when (optsNodeIx >= nNodes) $
+    error $ "node-index too high. Must be from 0 to " ++ show (nNodes - 1)
+  let envNodeIds = map snd nodes
+  let ((host, port), thisNode) = nodes !! optsNodeIx
 
   Right transport <- createTransport host port (\port' -> (host, port')) defaultTCPParameters
   localNode <- newLocalNode transport initRemoteTable
@@ -128,20 +124,19 @@ main = do
         -- atomically $ writeTChan logChan (Just line)
         B8.hPutStrLn stderr $ encodeUtf8 line
 
-  envState <- newMVar (NodeState mempty (V.replicate nPeers 0))
-  rnd <- initRandomGen (optsSeed + optsPeerIx)
+  envState <- newMVar (NodeState mempty (V.replicate nNodes 0))
+  rnd <- initRandomGen (optsSeed + optsNodeIx)
   -- envSendTimeOver <- newIORef False
   -- envRecvTimeOver <- newIORef False
   let envSendTimeOver = do
         (now, delta) <- getTimeDelta
         -- envSay $ tshow (now, delta, delta >= fromIntegral optsSendFor)
         return $ delta >= fromIntegral optsSendFor
-
   let envRecvTimeOver = (>= fromIntegral (optsSendFor + optsWaitFor)) . snd <$> getTimeDelta
   envScoreMVar <- newEmptyMVar
   let env = NodeEnv{envOpts = opts, envRandom = getRandom rnd, ..}
 
-  let otherNodes = [(i, node) | (i, node) <- zip [0..] envNodeIds, i /= optsPeerIx]
+  let otherNodes = [(i, node) | (i, node) <- zip [0..] envNodeIds, i /= optsNodeIx]
   senders <- forM otherNodes $ \(otherIx, otherNodeId) -> do
     forkProcess localNode $ msgSender env otherIx otherNodeId
   forM_ otherNodes $ \(otherIx, otherNodeId) -> do
@@ -184,8 +179,8 @@ generator NodeEnv{..} senderPids = do
        | otherwise -> do
         msgValue <- liftIO envRandom
         (msg, size) <- liftIO $ modifyMVar envState $ \state -> do
-          let msgTime = incrementTime optsPeerIx (stateTime state)
-          let msg = Msg { msgNodeIx = optsPeerIx, .. }
+          let msgTime = incrementTime optsNodeIx (stateTime state)
+          let msg = Msg { msgNodeIx = optsNodeIx, .. }
           let state' = state {stateTime = msgTime, stateHist = M.insert msgTime msgValue (stateHist state)}
           return (state', (msg, M.size (stateHist state')))
         envSay $ T.intercalate "\t" ["size: " ++ tshow size, "generator", tshowMsg msg]
@@ -202,7 +197,7 @@ msgSender env@NodeEnv{..} recvIx recvNodeId = do
   where
   Opts{..} = envOpts
   thisName = regName "msgSender" recvIx
-  recvName = regName "msgReceiver" optsPeerIx
+  recvName = regName "msgReceiver" optsNodeIx
   loop recvPid nSent = do
     -- instantly try to pick message from inbox, and if failed, request a new message from generator
     msg :: Msg <- expectTimeout 0 >>= maybe (nsend "generator" () >> expect) return
@@ -228,7 +223,7 @@ msgReceiver NodeEnv{..} senderIx senderNodeId = do
       False -> do
         msg@Msg{..} <- expect
         (time, size) <- liftIO $ modifyMVar envState $ \state -> do
-          let time' = mergeTime optsPeerIx msgTime (stateTime state)
+          let time' = mergeTime optsNodeIx msgTime (stateTime state)
           let state' = state {stateTime = time', stateHist = M.insert msgTime msgValue (stateHist state)}
           let size = M.size (stateHist state')
           return (state', (time', size))
@@ -236,7 +231,7 @@ msgReceiver NodeEnv{..} senderIx senderNodeId = do
         -- envSay $ T.unwords ["Inserted", tshowMsg msg]
   where
   Opts{..} = envOpts
-  -- senderName = regName "msgSender" optsPeerIx
+  -- senderName = regName "msgSender" optsNodeIx
   thisName = regName "msgReceiver" senderIx
 
 computeScore :: NodeEnv -> IO ()
@@ -276,9 +271,6 @@ tshowMsg Msg{..} = T.pack $ printf "%2d %.3f %s" msgNodeIx msgValue (show msgTim
 regName :: String -> Int -> String
 regName name i = name ++ show i
 
-hostPortToNode :: (String, String) -> NodeId
-hostPortToNode (host, port) = NodeId $ TCP.encodeEndPointAddress host port 0
-
 initRandomGen :: Integral a => a -> IO GenIO
 initRandomGen seed = Rnd.initialize $ V.singleton (fromIntegral seed)
 
@@ -297,7 +289,7 @@ optsParser :: Parser Opts
 optsParser = do
   -- optsHost <- optional $ strOption $ long "host" ++ short 'H'
   -- optsPort <- optional $ strOption $ long "port" ++ short 'P'
-  optsPeerIx <- option auto $ long "peer-ix" ++ short 'i'
+  optsNodeIx <- option auto $ long "node-index" ++ short 'i'
   optsSendFor <- option auto $ short 's' ++ long "send-for" ++ value 2
   optsSendMax <- optional $ option auto $ long "send-max"
   optsWaitFor <- option auto $ short 'w' ++ long "wait-for" ++ value 1
