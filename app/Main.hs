@@ -7,6 +7,8 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE MultiWayIf #-}
+{-# LANGUAGE BangPatterns #-}
+
 module Main where
 
 import Control.Distributed.Process hiding (newChan)
@@ -25,19 +27,25 @@ import BasicPrelude
 import qualified Data.Map as M
 import Data.IORef
 import Control.Concurrent.MVar
+import Control.Concurrent.STM.TChan
+import Control.Concurrent.STM
+
 import Control.Error.Util
 import System.Random.MWC
 import Data.Binary
 import Data.Vector.Binary ()
 import GHC.Generics
+import System.IO
 
 import qualified Data.Text as T
 import qualified Data.Text.IO as T
 import qualified Data.Vector as V
 import qualified System.Random.MWC as Rnd
 import Text.Printf (printf)
-import Data.Time.Clock.POSIX
-import Data.Time.Format
+import qualified Data.ByteString.Char8 as B8
+-- import Data.Time.Clock.POSIX
+-- import Data.Time.Format
+import Data.Time
 
 data Opts = Opts
   -- { optsHost :: Maybe String
@@ -81,12 +89,19 @@ data NodeEnv = NodeEnv
   , envSay :: forall m. MonadIO m => Text -> m ()
   , envState :: MVar NodeState
   , envRandom :: IO Double
-  , envSendTimeOver :: IORef Bool
-  , envRecvTimeOver :: IORef Bool
+  , envSendTimeOver :: IO Bool
+  , envRecvTimeOver :: IO Bool
+  , envStartTime :: UTCTime
+  , envScoreMVar :: MVar (Int, Double)
   }
 
 main :: IO ()
 main = do
+  envStartTime <- getCurrentTime
+  -- logChan <- newTChanIO
+  -- loggerDone <- newEmptyMVar
+  -- _ <- forkIO $ logger logChan >> putMVar loggerDone ()
+
   opts@Opts{..} <- execParser $ info (helper <*> optsParser) $ progDesc ""
   let hostPort@(host, port) = peersConf !! optsPeerIx
   -- print (host, port)
@@ -99,40 +114,58 @@ main = do
   Right transport <- createTransport host port (\port' -> (host, port')) defaultTCPParameters
   localNode <- newLocalNode transport initRemoteTable
 
-  stderrChan <- newChan
-  loggerDone <- newEmptyMVar
-  let writeLog text = do
-          t <- T.pack . formatTime defaultTimeLocale "%T%3Q " <$> getCurrentTime
-          errLn (t ++ text)
+  let getTimeDelta = do
+        now <- getCurrentTime
+        return (now, diffUTCTime now envStartTime)
 
-  let loop = do
-        s <- readChan stderrChan
-        if s == mempty then putMVar loggerDone "Logger done" else writeLog s >> loop
-  logger <- forkIO $ loop
   let envSay :: forall m. MonadIO m => Text -> m ()
-      envSay = liftIO . writeChan stderrChan
+      -- envSay _ = return ()
+      envSay text = liftIO $ do
+        (now, delta) <- getTimeDelta
+        let prefix1 = T.pack $ formatTime defaultTimeLocale "%T%3Q " now
+        let prefix2 = T.pack $ printf "%.3f" $ (realToFrac delta :: Double)
+        let line = T.unwords [prefix1, prefix2, text]
+        -- atomically $ writeTChan logChan (Just line)
+        B8.hPutStrLn stderr $ encodeUtf8 line
+
   envState <- newMVar (NodeState mempty (V.replicate nPeers 0))
   rnd <- initRandomGen (optsSeed + optsPeerIx)
-  envSendTimeOver <- newIORef False
-  envRecvTimeOver <- newIORef False
+  -- envSendTimeOver <- newIORef False
+  -- envRecvTimeOver <- newIORef False
+  let envSendTimeOver = do
+        (now, delta) <- getTimeDelta
+        -- envSay $ tshow (now, delta, delta >= fromIntegral optsSendFor)
+        return $ delta >= fromIntegral optsSendFor
+
+  let envRecvTimeOver = (>= fromIntegral (optsSendFor + optsWaitFor)) . snd <$> getTimeDelta
+  envScoreMVar <- newEmptyMVar
   let env = NodeEnv{envOpts = opts, envRandom = getRandom rnd, ..}
 
-  scoreVar <- newEmptyMVar
-  _ <- forkIO $ timer envSendTimeOver optsSendFor >> computeScore env optsWaitFor (putMVar scoreVar)
-  _ <- forkIO $ timer envRecvTimeOver (optsSendFor + optsWaitFor)
   let otherNodes = [(i, node) | (i, node) <- zip [0..] envNodeIds, i /= optsPeerIx]
   senders <- forM otherNodes $ \(otherIx, otherNodeId) -> do
     forkProcess localNode $ msgSender env otherIx otherNodeId
   forM_ otherNodes $ \(otherIx, otherNodeId) -> do
     forkProcess localNode $ msgReceiver env otherIx otherNodeId
   _ <- forkProcess localNode $ generator env senders
-  writeLog $ "Started "  ++ tshow thisNode
-  takeMVar scoreVar >>= \score -> do
+  envSay $ "Started "  ++ tshow thisNode
+  takeMVar envScoreMVar >> computeScore env
+  takeMVar envScoreMVar >>= \score -> do
     let out = T.pack $ uncurry (printf "(%d, %.0f)") score
     T.putStrLn out
     envSay $ "===> Score: " ++ out
-    envSay ""
-    takeMVar loggerDone >>= writeLog
+    -- atomically $ writeTChan logChan Nothing
+    -- takeMVar loggerDone
+
+-- logger :: TChan (Maybe Text) -> IO ()
+-- logger chan = do
+--   -- register "logger" =<< getSelfPid
+--   liftIO $ errLn $ "Logger started"
+--   loop
+--   where
+--   loop = do
+--     atomically (readTChan chan) >>= \case
+--       Just text -> errLn text >> loop
+--       Nothing -> errLn "Logger done"
 
 generator :: NodeEnv -> [ProcessId] -> Process ()
 generator NodeEnv{..} senderPids = do
@@ -143,9 +176,10 @@ generator NodeEnv{..} senderPids = do
   Opts{..} = envOpts
   loop nSent = do
     _ :: () <- expect
-    over <- liftIO (readIORef envSendTimeOver)
+    over <- liftIO envSendTimeOver
     if | over || maybe False (nSent >=) optsSendMax -> do
         envSay "Generator done"
+        liftIO $ putMVar envScoreMVar (0, 0)
         terminate
        | otherwise -> do
         msgValue <- liftIO envRandom
@@ -154,7 +188,7 @@ generator NodeEnv{..} senderPids = do
           let msg = Msg { msgNodeIx = optsPeerIx, .. }
           let state' = state {stateTime = msgTime, stateHist = M.insert msgTime msgValue (stateHist state)}
           return (state', (msg, M.size (stateHist state')))
-        envSay $ T.intercalate "\t" ["History size: " ++ tshow size, "generator", tshowMsg msg]
+        envSay $ T.intercalate "\t" ["size: " ++ tshow size, "generator", tshowMsg msg]
         forM_ senderPids $ \pid -> send pid msg
         loop (nSent + 1)
 
@@ -185,8 +219,9 @@ msgReceiver NodeEnv{..} senderIx senderNodeId = do
   -- nsendRemote senderNodeId senderName thisPid
   -- senderPid :: ProcessId <- expect
   -- envSay $ T.intercalate "\t" [T.pack thisName, "received pid"]
+  -- liftIO $ threadDelay 1000000
   forever $ do
-    liftIO (readIORef envRecvTimeOver) >>= \case
+    liftIO envRecvTimeOver >>= \case
       True -> do
         envSay $ "Done: " ++ T.pack thisName
         terminate
@@ -197,49 +232,49 @@ msgReceiver NodeEnv{..} senderIx senderNodeId = do
           let state' = state {stateTime = time', stateHist = M.insert msgTime msgValue (stateHist state)}
           let size = M.size (stateHist state')
           return (state', (time', size))
-        envSay $ T.intercalate "\t" ["History size: " ++ tshow size, T.pack thisName, tshowMsg msg, "@" ++ tshow time]
+        envSay $ T.intercalate "\t" ["size: " ++ tshow size, T.pack thisName, tshowMsg msg, "@" ++ tshow time]
         -- envSay $ T.unwords ["Inserted", tshowMsg msg]
   where
   Opts{..} = envOpts
   -- senderName = regName "msgSender" optsPeerIx
   thisName = regName "msgReceiver" senderIx
 
-computeScore :: NodeEnv -> Int -> ((Int, Double) -> IO ()) -> IO ()
-computeScore NodeEnv{..} waitFor putScore = do
-  threadDelay $ (waitFor * 900 * 10^3 :: Int)
+computeScore :: NodeEnv -> IO ()
+computeScore NodeEnv{..} = do
+  threadDelay $ (optsWaitFor envOpts * 10^6 - 500*10^3 :: Int)
   hist <- stateHist <$> takeMVar envState
   let score = sum [fromIntegral i * val | (i, (_, val)) <- zip [1 :: Int ..] (M.toAscList hist)]
-  putScore (M.size hist, score)
+  putMVar envScoreMVar (M.size hist, score)
 
 getRemotePid :: NodeEnv -> String -> NodeId -> String -> Process ProcessId
 getRemotePid NodeEnv{..} thisName otherNodeId otherName = loop 0
   where
   loop n = do
-    thisPid <- getSelfPid
-    -- envSay $ T.intercalate "\t" [T.pack thisName, "sent pid"]
-    whereisRemoteAsync otherNodeId otherName
-    let timeoutMicro = min 50000 (round $ 1.1 ^ n)
-    expectTimeout timeoutMicro >>= \case
-      Just (WhereIsReply name (Just pid)) -> do -- yay!
-        envSay $ T.unwords [T.pack thisName, "connected"]
-        return pid
-      other -> do
-        case other of
-          Just (WhereIsReply wtf _) ->
-            envSay $ T.intercalate "\t" ["WARN", T.pack thisName, "whereis: ", T.pack wtf]
-          Nothing -> return ()
-        loop (n + 1)
-
-timer :: IORef Bool -> Int -> IO ()
-timer eventRef delay = do
-  threadDelay $ delay * 10^6
-  atomicWriteIORef eventRef True
+    liftIO envRecvTimeOver >>= \case
+      True -> do
+        envSay "getRemotePid done"
+        terminate
+      False -> do
+        thisPid <- getSelfPid
+        -- envSay $ T.intercalate "\t" [T.pack thisName, "sent pid"]
+        whereisRemoteAsync otherNodeId otherName
+        let timeoutMicro = min 50000 (round $ 1.1 ^ n)
+        expectTimeout timeoutMicro >>= \case
+          Just (WhereIsReply name (Just pid)) -> do -- yay!
+            envSay $ T.unwords [T.pack thisName, "connected"]
+            return pid
+          other -> do
+            case other of
+              Just (WhereIsReply wtf _) ->
+                envSay $ T.intercalate "\t" ["WARN", T.pack thisName, "whereis: ", T.pack wtf]
+              Nothing -> return ()
+            loop (n + 1)
 
 tshowMsg :: Msg -> Text
-tshowMsg Msg{..} = T.pack $ printf "( %2d %.3f %s )" msgNodeIx msgValue (show msgTime)
+tshowMsg Msg{..} = T.pack $ printf "%2d %.3f %s" msgNodeIx msgValue (show msgTime)
 
 regName :: String -> Int -> String
-regName name i = name ++ " " ++ show i
+regName name i = name ++ show i
 
 hostPortToNode :: (String, String) -> NodeId
 hostPortToNode (host, port) = NodeId $ TCP.encodeEndPointAddress host port 0
@@ -268,3 +303,13 @@ optsParser = do
   optsWaitFor <- option auto $ short 'w' ++ long "wait-for" ++ value 1
   optsSeed <- option auto $ long "with-seed" ++ value 0
   return Opts{..}
+
+-- timer :: NodeEnv -> IORef Bool -> Int -> IO ()
+-- timer NodeEnv{..} eventRef delay = do
+--   now <- getCurrentTime
+--   let delta = diffUTCTime now envStartTime
+--   let adjustedDelay = fromIntegral delay - realToFrac delta :: Double
+--   envSay $ "Timer set for " ++ tshow adjustedDelay ++ " seconds from now"
+--   threadDelay $ floor $ adjustedDelay * 10^6
+--   envSay $ "Timer alarm for delay " ++ tshow delay
+--   atomicWriteIORef eventRef True
