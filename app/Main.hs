@@ -8,6 +8,8 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE TupleSections #-}
+{-# LANGUAGE ViewPatterns #-}
 
 module Main where
 
@@ -20,6 +22,7 @@ import Network.Transport.TCP (createTransport, defaultTCPParameters)
 import qualified Network.Transport.TCP.Internal as TCP
 
 import Control.Concurrent
+import Control.Exception (throw)
 import Control.Monad (forever)
 import Options.Applicative
 -- import ClassyPrelude
@@ -69,10 +72,12 @@ instance Binary Msg
 
 type History = Map Timestamp Double
 type Timestamp = V.Vector Int
+
 data NodeState = NodeState
   { stateHist :: !History
   , stateTime :: !Timestamp
   } deriving (Show)
+
 data NodeEnv = NodeEnv
   { envOpts :: Opts
   , envNodeIds :: [NodeId]
@@ -88,10 +93,11 @@ data NodeEnv = NodeEnv
 getNodeList :: IO [((String, String), NodeId)]
 getNodeList = do
   rows <- T.lines <$> T.readFile "nodes.txt"
-  return $ map (node . map T.unpack . T.splitOn ":") rows
+  return $ map node rows
   where
-  node [host, port] =
+  node (map T.unpack . T.splitOn ":" -> [host, port]) =
     ((host, port), NodeId $ TCP.encodeEndPointAddress host port 0)
+  node line = terror $ "Node address must be in form host:port. Got this instead: " ++ line
 
 main :: IO ()
 main = do
@@ -107,7 +113,7 @@ main = do
   let envNodeIds = map snd nodes
   let ((host, port), thisNode) = nodes !! optsNodeIx
 
-  Right transport <- createTransport host port (\port' -> (host, port')) defaultTCPParameters
+  transport <- either throw id <$> createTransport host port (host,) defaultTCPParameters
   localNode <- newLocalNode transport initRemoteTable
 
   let getTimeDelta = do
