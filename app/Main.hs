@@ -24,35 +24,29 @@ import qualified Network.Transport.TCP.Internal as TCP
 import Control.Concurrent
 import Control.Exception (throw)
 import Control.Monad (forever)
-import Options.Applicative
--- import ClassyPrelude
-import BasicPrelude
-import qualified Data.Map as M
-import Data.IORef
 import Control.Concurrent.MVar
 import Control.Concurrent.STM.TChan
 import Control.Concurrent.STM
-
 import Control.Error.Util
+
+import Options.Applicative
+import BasicPrelude
+import qualified Data.Map as M
+import Data.IORef
 import System.Random.MWC
 import Data.Binary
 import Data.Vector.Binary ()
 import GHC.Generics
 import System.IO
-
 import qualified Data.Text as T
 import qualified Data.Text.IO as T
 import qualified Data.Vector as V
 import qualified System.Random.MWC as Rnd
 import Text.Printf (printf)
 import qualified Data.ByteString.Char8 as B8
--- import Data.Time.Clock.POSIX
--- import Data.Time.Format
 import Data.Time
 
 data Opts = Opts
-  -- { optsHost :: Maybe String
-  -- , optsPort :: Maybe String
   { optsNodeIx :: Int
   , optsSendFor :: Int
   , optsWaitFor :: Int
@@ -102,9 +96,6 @@ getNodeList = do
 main :: IO ()
 main = do
   envStartTime <- getCurrentTime
-  -- logChan <- newTChanIO
-  -- loggerDone <- newEmptyMVar
-  -- _ <- forkIO $ logger logChan >> putMVar loggerDone ()
   opts@Opts{..} <- execParser $ info (helper <*> optsParser) $ progDesc ""
   nodes <- getNodeList
   let nNodes = length nodes
@@ -121,22 +112,17 @@ main = do
         return (now, diffUTCTime now envStartTime)
 
   let envSay :: forall m. MonadIO m => Text -> m ()
-      -- envSay _ = return ()
       envSay text = liftIO $ do
         (now, delta) <- getTimeDelta
         let prefix1 = T.pack $ formatTime defaultTimeLocale "%T%3Q " now
         let prefix2 = T.pack $ printf "%.3f" $ (realToFrac delta :: Double)
         let line = T.unwords [prefix1, prefix2, text]
-        -- atomically $ writeTChan logChan (Just line)
         B8.hPutStrLn stderr $ encodeUtf8 line
 
   envState <- newMVar (NodeState mempty (V.replicate nNodes 0))
   rnd <- initRandomGen (optsSeed + optsNodeIx)
-  -- envSendTimeOver <- newIORef False
-  -- envRecvTimeOver <- newIORef False
   let envSendTimeOver = do
         (now, delta) <- getTimeDelta
-        -- envSay $ tshow (now, delta, delta >= fromIntegral optsSendFor)
         return $ delta >= fromIntegral optsSendFor
   let envRecvTimeOver = (>= fromIntegral (optsSendFor + optsWaitFor)) . snd <$> getTimeDelta
   envScoreMVar <- newEmptyMVar
@@ -154,19 +140,6 @@ main = do
     let out = T.pack $ uncurry (printf "(%d, %.0f)") score
     T.putStrLn out
     envSay $ "===> Score: " ++ out
-    -- atomically $ writeTChan logChan Nothing
-    -- takeMVar loggerDone
-
--- logger :: TChan (Maybe Text) -> IO ()
--- logger chan = do
---   -- register "logger" =<< getSelfPid
---   liftIO $ errLn $ "Logger started"
---   loop
---   where
---   loop = do
---     atomically (readTChan chan) >>= \case
---       Just text -> errLn text >> loop
---       Nothing -> errLn "Logger done"
 
 generator :: NodeEnv -> [ProcessId] -> Process ()
 generator NodeEnv{..} senderPids = do
@@ -193,7 +166,6 @@ generator NodeEnv{..} senderPids = do
         forM_ senderPids $ \pid -> send pid msg
         loop (nSent + 1)
 
--- msgSender :: Int -> [NodeId] -> IO Double -> IORef Bool -> MVar NodeState -> Process ()
 msgSender :: NodeEnv -> Int -> NodeId -> Process ()
 msgSender env@NodeEnv{..} recvIx recvNodeId = do
   thisPid <- getSelfPid
@@ -211,16 +183,10 @@ msgSender env@NodeEnv{..} recvIx recvNodeId = do
     envSay $ T.intercalate "\t" [T.pack thisName, tshowMsg msg]
     loop recvPid (nSent + 1)
 
--- msgReceiver :: Int -> [NodeId] -> IORef Bool -> MVar NodeState -> Process ()
 msgReceiver :: NodeEnv -> Int -> NodeId -> Process ()
 msgReceiver NodeEnv{..} senderIx senderNodeId = do
   thisPid <- getSelfPid
   register thisName thisPid
-  -- envSay $ T.intercalate "\t" [T.pack thisName, "sent pid"]
-  -- nsendRemote senderNodeId senderName thisPid
-  -- senderPid :: ProcessId <- expect
-  -- envSay $ T.intercalate "\t" [T.pack thisName, "received pid"]
-  -- liftIO $ threadDelay 1000000
   forever $ do
     liftIO envRecvTimeOver >>= \case
       True -> do
@@ -234,10 +200,8 @@ msgReceiver NodeEnv{..} senderIx senderNodeId = do
           let size = M.size (stateHist state')
           return (state', (time', size))
         envSay $ T.intercalate "\t" ["size: " ++ tshow size, T.pack thisName, tshowMsg msg, "@" ++ tshow time]
-        -- envSay $ T.unwords ["Inserted", tshowMsg msg]
   where
   Opts{..} = envOpts
-  -- senderName = regName "msgSender" optsNodeIx
   thisName = regName "msgReceiver" senderIx
 
 computeScore :: NodeEnv -> IO ()
@@ -257,7 +221,6 @@ getRemotePid NodeEnv{..} thisName otherNodeId otherName = loop 0
         terminate
       False -> do
         thisPid <- getSelfPid
-        -- envSay $ T.intercalate "\t" [T.pack thisName, "sent pid"]
         whereisRemoteAsync otherNodeId otherName
         let timeoutMicro = min 50000 (round $ 1.1 ^ n)
         expectTimeout timeoutMicro >>= \case
@@ -288,26 +251,13 @@ incrementTime thisIx = V.imap (\i -> if i == thisIx then succ else id)
 
 mergeTime :: Int -> Timestamp -> Timestamp -> Timestamp
 mergeTime thisIx senderTime thisTime =
-  -- V.izipWith (\i that this -> if i == thisIx then this + 1 else max that this) senderTime thisTime
   V.zipWith max senderTime thisTime
 
 optsParser :: Parser Opts
 optsParser = do
-  -- optsHost <- optional $ strOption $ long "host" ++ short 'H'
-  -- optsPort <- optional $ strOption $ long "port" ++ short 'P'
   optsNodeIx <- option auto $ long "node-index" ++ short 'i'
   optsSendFor <- option auto $ short 's' ++ long "send-for" ++ value 2
   optsSendMax <- optional $ option auto $ long "send-max"
   optsWaitFor <- option auto $ short 'w' ++ long "wait-for" ++ value 1
   optsSeed <- option auto $ long "with-seed" ++ value 0
   return Opts{..}
-
--- timer :: NodeEnv -> IORef Bool -> Int -> IO ()
--- timer NodeEnv{..} eventRef delay = do
---   now <- getCurrentTime
---   let delta = diffUTCTime now envStartTime
---   let adjustedDelay = fromIntegral delay - realToFrac delta :: Double
---   envSay $ "Timer set for " ++ tshow adjustedDelay ++ " seconds from now"
---   threadDelay $ floor $ adjustedDelay * 10^6
---   envSay $ "Timer alarm for delay " ++ tshow delay
---   atomicWriteIORef eventRef True
